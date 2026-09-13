@@ -2,9 +2,34 @@
 """接口出入参模型。"""
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from typing import Literal
 
 
+# 增加crewai的结构化输出模型
+class IntentResult(BaseModel):
+    intent: Literal[
+        "knowledge",
+        "order",
+        "after_sale_rule",
+        "chat",
+    ]
+    reason: str = Field(description="判断该意图的原因")
+
+
+class CrewAnswer(BaseModel):
+    reply: str
+    sources: list[str] = []
+
+
+class CrewResult(BaseModel):
+    reply: str
+    intent: str
+    reason: str = ""
+    sources: list[str] = []
+
+#描述最终HTTP响应的模型
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = "default"

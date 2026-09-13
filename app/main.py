@@ -61,8 +61,10 @@ async def lifespan(_: FastAPI):
     sample = BASE_DIR / "data" / "knowledge_base.md"
     if sample.exists() and kb.chunk_count == 0:
         try:
-            kb.ingest_file(sample)
+            kb.ingest_file(sample) # 导入示例知识库，在app.rag.retriever中的ingest_file方法读取 Markdown-》按标题分块——>调用 Embedding->写入向量库->构建 BM25 索引
         except Exception as exc:
+            #即使 Embedding 配置错误，服务仍然可以启动，只是知识库可能为空。
+            #需要注意：这里是同步调用 kb.ingest_file()，如果知识库非常大，会阻塞启动过程。
             logger.warning("启动时导入示例知识库失败（请检查 AIROBOT_EMBEDDING_API_KEY）: %s", exc)
     yield
 
