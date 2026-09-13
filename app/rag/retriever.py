@@ -231,16 +231,7 @@ class KnowledgeBase:
 
 
 kb = KnowledgeBase()
-"""
-是全局知识库对象，内部包含：
-Embedding
-向量库
-BM25
-重排器
-文档列表
-分块统计
-因此服务进程启动后会复用同一个知识库，避免每次请求都重新初始化。
-"""
+
 
 RAG_PROMPT = ChatPromptTemplate.from_messages([
     ("system",

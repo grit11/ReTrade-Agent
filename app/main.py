@@ -1,25 +1,6 @@
 # -*- coding: utf-8 -*-
-"""FastAPI 应用入口。
-
-本模块负责把底层能力组装成 HTTP 服务，主要包含：
-
-* 应用生命周期：启动时自动导入示例知识库；
-* HTTP 中间件：请求耗时日志、响应耗时响应头、按 IP 限流；
-* 基础运维接口：``/health``、``/api/v1/stats``、``/api/v1/traces``；
-* 知识库接口：``/api/v1/ingest``；
-* 对话接口：普通 JSON 对话 ``/api/v1/chat`` 和 SSE 流式对话
-  ``/api/v1/chat/stream``；
-* 统一异常兜底：记录服务端完整异常，但向客户端返回稳定的错误结构。
-
-需要特别区分两条对话路径：
-
-``/api/v1/chat``
-    调用 ``app.services.chat.chat``，由该服务决定先走 CrewAI，还是
-    降级到 LangChain 内置路由。
-
-``/api/v1/chat/stream``
-    在本文件中直接编排缓存、意图识别、RAG/订单工具和 SSE 事件，当前
-    不调用 CrewAI，适合把中间阶段实时展示给前端控制台。
+"""FastAPI 入口：健康检查 / 知识导入 / 对话 / SSE 流式对话。
+含请求日志中间件与统一异常兜底；chat 接口为异步实现（ainvoke / astream）。
 """
 import asyncio
 import json
@@ -47,24 +28,12 @@ logger = logging.getLogger("airobot.main")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """管理 FastAPI 应用的启动与关闭生命周期。
-
-    FastAPI 会在应用启动前执行 ``yield`` 之前的代码，在应用关闭时执行
-    ``yield`` 之后的代码。本项目目前没有关闭清理逻辑，因此这里主要做
-    启动初始化：如果全局知识库为空，就导入 ``data/knowledge_base.md``。
-
-    使用全局 ``kb`` 的原因是检索器、Embedding、BM25 索引和可选重排器都
-    需要在进程内复用；如果每个请求重新创建，会导致重复初始化甚至重复
-    向量化。导入失败只记录 warning，不阻止健康检查和 API 服务启动，便于
-    用户先启动服务、再检查 Embedding 配置。
-    """
+    """启动时自动导入示例知识库，保证开箱即用。"""
     sample = BASE_DIR / "data" / "knowledge_base.md"
     if sample.exists() and kb.chunk_count == 0:
         try:
-            kb.ingest_file(sample) # 导入示例知识库，在app.rag.retriever中的ingest_file方法读取 Markdown-》按标题分块——>调用 Embedding->写入向量库->构建 BM25 索引
+            kb.ingest_file(sample)
         except Exception as exc:
-            #即使 Embedding 配置错误，服务仍然可以启动，只是知识库可能为空。
-            #需要注意：这里是同步调用 kb.ingest_file()，如果知识库非常大，会阻塞启动过程。
             logger.warning("启动时导入示例知识库失败（请检查 AIROBOT_EMBEDDING_API_KEY）: %s", exc)
     yield
 
@@ -78,12 +47,7 @@ app = FastAPI(
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """记录每个 HTTP 请求的状态和耗时。
-
-    ``call_next`` 会继续调用后续中间件和路由处理器。本函数使用单调高精度
-    计时器计算耗时，并将结果写入日志和 ``X-Process-Time-Ms`` 响应头，方便
-    网关、浏览器和控制台观察接口延迟。
-    """
+    """请求日志 + 耗时统计（后续可接 OpenTelemetry / 指标埋点）。"""
     start = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = (time.perf_counter() - start) * 1000
@@ -95,13 +59,7 @@ async def log_requests(request: Request, call_next):
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    """在业务接口入口执行按 IP 的滑动窗口限流。
-
-    只有 ``/api/v1`` 下的业务接口参与限流；``stats`` 和 ``traces`` 被
-    明确排除，使监控控制台在业务请求过多时仍然可以读取状态。被拦截的
-    请求会写入 ``traces`` 并返回 HTTP 429；放行时必须调用 ``call_next``，
-    请求才会继续到达目标路由。
-    """
+    """接口限流：滑动窗口（按 IP，60 秒），返回 JSON 429。"""
     if (settings.ratelimit_enabled and request.url.path.startswith("/api/v1")
             and request.url.path not in ("/api/v1/stats", "/api/v1/traces")):
         client_ip = request.client.host if request.client else "unknown"
@@ -116,36 +74,19 @@ async def rate_limit_middleware(request: Request, call_next):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    """处理没有被业务代码捕获的异常。
-
-    服务端日志保存完整堆栈，客户端只收到固定的 500 JSON，避免暴露内部
-    路径、第三方 SDK 细节或其他敏感信息。流式接口在自己的生成器中捕获
-    异常，因此通常会发送 ``stage=error`` 事件，而不是走这里的普通 JSON。
-    """
+    """统一异常兜底：非流式接口返回 JSON 500，避免堆栈泄露给客户端。"""
     logger.exception("未处理异常: %s %s", request.method, request.url.path)
     return JSONResponse(status_code=500, content={"detail": "服务内部错误，请稍后重试。"})
 
 
 @app.get("/health")
 def health():
-    """返回最小健康检查结果。
-
-    该接口只读取配置，不调用 LLM、Embedding 或知识库，适合容器
-    healthcheck、负载均衡探活和启动脚本轮询。``status=ok`` 表示 Web 进程
-    可响应，并不保证外部模型服务一定可用。
-    """
     return {"status": "ok", "llm_model": settings.llm_model,
             "embedding_model": settings.embedding_model}
 
 
 @app.get("/api/v1/stats", response_model=StatsResponse)
 def stats():
-    """汇总当前进程的运行状态和关键指标。
-
-    数据来自知识库 ``kb``、语义缓存 ``semantic_cache`` 和限流器 ``limiter``。
-    ``crew_available`` 表示 CrewAI 工具是否成功导入，``use_crew`` 表示配置
-    开关；普通 ``/api/v1/chat`` 只有在二者同时为真时才会尝试 CrewAI。
-    """
     cache = semantic_cache.stats()
     rl = limiter.stats()
     return StatsResponse(
@@ -170,35 +111,19 @@ def stats():
 
 @app.get("/dashboard")
 def dashboard():
-    """返回内置单页监控控制台。
-
-    页面是仓库中的静态 HTML，无需额外前端构建；浏览器打开后会轮询
-    ``/api/v1/stats``、``/api/v1/traces``，并调用流式对话接口展示缓存、
-    意图、检索和生成阶段。
-    """
+    """可视化控制台：功能导览 + 实时请求监控（页面轮询 /api/v1/stats 与 /api/v1/traces）。"""
     html = (BASE_DIR / "app" / "static" / "dashboard.html").read_text(encoding="utf-8")
     return HTMLResponse(html)
 
 
 @app.get("/api/v1/traces")
 def traces_api(limit: int = 50):
-    """返回最近请求明细和聚合追踪统计。
-
-    ``limit`` 控制返回的最近请求条数；聚合摘要仍基于环形缓冲区中的全部
-    记录，包含平均耗时、P95、缓存命中率、限流次数和意图分布。
-    """
+    """链路追踪：最近请求各阶段耗时 + 聚合统计（P95 / 缓存命中率 / 限流拦截数）。"""
     return {"entries": traces.recent(limit), "summary": traces.summary()}
 
 
 @app.post("/api/v1/ingest", response_model=IngestResponse)
 async def ingest(file: UploadFile = File(...)):
-    """上传并导入一个知识库文件。
-
-    处理步骤是：检查 Embedding Key；校验扩展名；把上传内容写入临时文件；
-    调用 ``kb.ingest_file`` 完成解析、分块、向量入库和 BM25 更新；最后在
-    ``finally`` 中删除临时文件并返回本次新增/当前总分块数。默认内存向量库
-    的导入结果只对当前服务进程有效。
-    """
     if not settings.embedding_api_key:
         raise HTTPException(status_code=400, detail="未配置 AIROBOT_EMBEDDING_API_KEY，无法向量化入库")
     suffix = Path(file.filename or "").suffix.lower()
@@ -220,12 +145,6 @@ async def ingest(file: UploadFile = File(...)):
 
 @app.post("/api/v1/chat", response_model=ChatResponse)
 async def chat_ep(req: ChatRequest):
-    """普通 JSON 对话接口的薄适配层。
-
-    真正的编排位于 ``app.services.chat.chat``：包括首轮语义缓存、CrewAI
-    优先路径、LangChain fallback、RAG/订单/闲聊、会话记忆和链路追踪。本
-    函数只负责把 HTTP 请求模型传入服务，并转换成稳定的响应模型。
-    """
     result = await chat(req.message, req.session_id)
     return ChatResponse(
         reply=result["reply"],
@@ -238,28 +157,14 @@ async def chat_ep(req: ChatRequest):
 
 
 def _sse(payload: dict) -> str:
-    """把字典编码成标准 SSE 数据帧。
-
-    SSE 要求事件以 ``data:`` 开头，并用空行结束；``ensure_ascii=False``
-    保证中文不会被编码成 ASCII 转义。所有 stage、intent、token、done 事件
-    都通过这里统一格式化。
-    """
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 @app.post("/api/v1/chat/stream")
 async def chat_stream(req: ChatRequest):
-    """SSE 流式对话接口。
-
-    本接口在当前文件中直接编排 ``限流事件 -> 语义缓存 -> 意图识别 ->
-    RAG/订单/闲聊 -> done``。RAG 和闲聊通过 ``chain.astream`` 逐片段发送
-    token；订单工具一次性发送一个 token；多轮会话跳过语义缓存。注意：
-    这条 SSE 路径当前不调用 CrewAI，而是直接使用 ``classify_intent`` 和
-    工具/RAG。
-    """
+    """SSE 流式对话：意图 -> (RAG/闲聊) 逐 token 输出；订单查询整段返回；带会话记忆。"""
 
     async def _error(message: str):
-        """在无法正常开始流式处理时，发送最小错误事件序列。"""
         yield _sse({"type": "token", "content": message})
         yield _sse({"type": "done"})
 
@@ -274,23 +179,15 @@ async def chat_stream(req: ChatRequest):
     from app.services.memory import memory
 
     async def gen():
-        """生成一次流式对话的全部 SSE 事件。
-
-        生成器既负责向前端报告中间阶段，也负责请求结束后的会话记忆、语义
-        缓存和 TraceRecorder 写入；前端用 ``done`` 事件收束本次请求。
-        """
         t_start = time.perf_counter()
         entry = {"message": req.message[:80], "session_id": req.session_id,
                  "status": 200, "engine": "sse"}
         try:
-            # 限流中间件已经在进入路由前完成真正检查；这里发送成功事件，
-            # 让前端控制台的时间线保持完整。
             yield _sse({"type": "stage", "stage": "rate_limit",
                         "msg": "限流检查通过，请求进入服务", "ms": 0.0, "ok": True})
             history = memory.get_messages(req.session_id)
             query_vec = None
             if settings.cache_enabled and settings.embedding_api_key and not history:
-                # Embedding 接口是同步调用，放入线程池，避免阻塞事件循环。
                 t_cache = time.perf_counter()
                 yield _sse({"type": "stage", "stage": "cache", "msg": "语义缓存查询中…", "ms": 0.0})
                 query_vec = await asyncio.to_thread(kb.embed_query, req.message)
@@ -315,11 +212,9 @@ async def chat_stream(req: ChatRequest):
                 yield _sse({"type": "stage", "stage": "cache", "msg": "语义缓存未命中", "ms": cache_ms,
                             "hit": False, "ok": True})
             else:
-                # 有历史时跳过缓存，避免同一个问题因上下文不同而复用错误答案。
                 reason = "未开启" if not (settings.cache_enabled and settings.embedding_api_key) else "多轮会话，跳过缓存"
                 yield _sse({"type": "stage", "stage": "cache", "msg": f"跳过语义缓存（{reason}）",
                             "ms": 0.0, "ok": True, "skipped": True})
-            # 流式链路直接做意图分类；解析失败时 classify_intent 会兜底为 chat。
             t_intent = time.perf_counter()
             intent = await classify_intent(req.message)
             intent_ms = round((time.perf_counter() - t_intent) * 1000, 1)
@@ -330,8 +225,6 @@ async def chat_stream(req: ChatRequest):
                         "intent": intent, "ms": intent_ms, "ok": True})
 
             if intent == "order":
-                # 订单是动态数据，不走 RAG，也不写入语义缓存。当前工具是
-                # Mock，生产环境可替换为订单服务 HTTP 调用。
                 t_tool = time.perf_counter()
                 reply = query_order(req.message)
                 tool_ms = round((time.perf_counter() - t_tool) * 1000, 1)
@@ -347,7 +240,6 @@ async def chat_stream(req: ChatRequest):
                 return
 
             if intent == "knowledge" and kb.chunk_count > 0:
-                # 检索通常包含同步向量/BM25/重排操作，放入线程池避免阻塞事件循环。
                 t_retr = time.perf_counter()
                 docs, detail = await asyncio.to_thread(kb.search_detailed, req.message)
                 retr_ms = round((time.perf_counter() - t_retr) * 1000, 1)
@@ -357,8 +249,6 @@ async def chat_stream(req: ChatRequest):
                 yield _sse({"type": "stage", "stage": "retrieval", "msg": "混合检索完成",
                             "ms": retr_ms, "detail": detail, "sources": sources, "ok": True})
                 context = "\n\n".join(d.page_content for d in docs)
-                # RAG Prompt 接收检索上下文、问题和历史；astream 每产出一段
-                # 文本，就立即转换成 token 事件发给前端。
                 chain = RAG_PROMPT | build_llm() | StrOutputParser()
                 parts: list[str] = []
                 t_gen = time.perf_counter()
@@ -389,8 +279,6 @@ async def chat_stream(req: ChatRequest):
                 traces.record(entry)
                 return
 
-            # 意图不是 knowledge，或 knowledge 但知识库为空时，走闲聊 Prompt。
-            # 这是 SSE 实现的行为；非流式 fallback_chat 对空知识库有专门提示。
             chain = CHAT_PROMPT | build_llm() | StrOutputParser()
             parts = []
             t_gen = time.perf_counter()
@@ -419,8 +307,6 @@ async def chat_stream(req: ChatRequest):
             entry.update(total_ms=round((time.perf_counter() - t_start) * 1000, 1))
             traces.record(entry)
         except Exception as exc:
-            # 生成器内部捕获异常，保证客户端仍能收到结构化结束事件；服务端
-            # 日志保留完整堆栈，方便排查。
             logger.exception("流式对话异常: %s", exc)
             entry.update(status=500,
                          total_ms=round((time.perf_counter() - t_start) * 1000, 1))

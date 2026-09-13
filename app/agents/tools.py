@@ -6,48 +6,16 @@
 - search_knowledge / query_order / after_sale_rule：原始函数，内置路由与 SSE 流式直接调用；
 - *_tool 变体：CrewAI Tool 包装（仅安装 crewai 后存在），供多 Agent 编排使用。
 """
-import json
 import re
 
 from app.rag.retriever import answer_with_rag, build_llm
 
+
 def search_knowledge(query: str) -> str:
     """检索平台知识库并基于资料回答问题（RAG）。"""
-    answer, sources = answer_with_rag(query, build_llm())
-    # CrewAI 工具的返回值必须是可传递给下一个 Agent 的内容。
-    # 原来只返回 answer，导致 RAG 的 sources 在这里被丢弃，
-    # Executive 最终只能生成 sources=[]。将答案和来源一起编码为 JSON，
-    # 让 Executive 可以读取并复制到 CrewAnswer.sources。
-    # json.dumps = dump to string，把 Python 对象转成 JSON 字符串。反过来是 json.loads（load from string）。
-    return json.dumps(  
-        {
-            "answer": answer,
-            "sources": list(sources or []),
-        },
-        ensure_ascii=False, #为了让中文保持正常显示
-    )
-    """
-    CrewAI 的工具消息中就会变成：
-    {
-        "role": "tool",
-        "name": "search_knowledge",
-        "content": "{\"answer\":\"发布商品很简单……\",\"sources\":[\"knowledge_base.md#3\"]}"
-    }
+    answer, _ = answer_with_rag(query, build_llm())
+    return answer
 
-    # JSON 字符串的完整流转
-        search_knowledge 工具
-            │  返回: '{"answer": "七天无理由退货...", "sources": ["售后政策.md"]}'
-            ▼
-        Executive Agent 看到这段 JSON 文本
-            │  从中提取 answer 和 sources
-            ▼
-        CrewAnswer(reply="七天无理由退货...", sources=["售后政策.md"])
-    
-    然后 crew.py 中兜底防止agent没有返回sources可以这样解析：
-    tool_data = json.loads(content)
-    tool_sources = tool_data.get("sources", [])
-
-    """
 
 def query_order(message: str) -> str:
     """查询用户订单状态与物流信息（Mock 数据）。"""
@@ -69,7 +37,7 @@ def after_sale_rule(_message: str) -> str:
 search_knowledge_tool = None
 query_order_tool = None
 after_sale_rule_tool = None
-CREW_TOOLS_READY = True
+CREW_TOOLS_READY = False
 try:
     from crewai.tools import tool
     search_knowledge_tool = tool("search_knowledge")(search_knowledge)

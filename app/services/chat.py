@@ -25,7 +25,7 @@ logger = logging.getLogger("airobot.chat")
 
 INTENT_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "你是意图分类器，只输出 JSON：{{\"intent\": \"knowledge|order|after_sale_rule|chat\", \"reason\": \"简短理由\"}}"),
+     "你是意图分类器，只输出 JSON：{{\"intent\": \"knowledge|order|chat\", \"reason\": \"简短理由\"}}"),
     ("human", "{message}"),
 ])
 
@@ -109,30 +109,16 @@ async def chat(message: str, session_id: str = "default") -> dict:
     t_llm = time.perf_counter()
     if settings.use_crew and CREW_TOOLS_READY:
         try:
-            #memory.get_messages(session_id) 取出该会话的多轮历史消息
-            #format_history() 把消息列表拼成自然语言文本，方便后续直接塞进 Prompt
-            #因为 CrewAI 的 Task 期望的是纯字符串输入，而不是 LangChain 的 MessagesPlaceholder
-            history_text = format_history(memory.get_messages(session_id))  
+            history_text = format_history(memory.get_messages(session_id))
             from app.agents.crew import run_crew
-            """
-            CrewAI 的 kickoff() 是同步阻塞的（内部有循环、sleep、API 调用等），
-            而 chat() 是 async def 异步函数。如果直接调用 run_crew()，会卡住整个事件循环，导致其他请求无法响应。
-            用 to_thread() 相当于"开个后台线程跑，跑完告诉我结果"。
-            """
-            ##async def to_thread(func, /, *args, **kwargs),传递给这个函数的参数都会直接传递给 func。# run_crew(message: str, history_text: str = "") -> str:
-            crew_result = await asyncio.to_thread(run_crew, message, history_text)   
-            # CrewResult 的 sources 可能为空；先规范为列表，避免未定义变量或 None
-            # 进入缓存、追踪和 FastAPI 响应转换逻辑。
-            sources = [str(item) for item in (crew_result.sources or [])]
-            result = {"reply": crew_result.reply, "intent": crew_result.intent, "sources": sources,
+            reply = await asyncio.to_thread(run_crew, message, history_text)
+            result = {"reply": reply, "intent": "crew", "sources": [],
                       "engine": "crew", "used_crew": True}
-            #性能追踪：这些数据会通过 traces.record(entry) 上报，用于监控和调试。缓存 → 记忆 → 追踪，然后返回 result。
-            entry.update(intent=result["intent"], engine=result["engine"],     
+            entry.update(intent="crew", engine="crew",
                          llm_ms=round((time.perf_counter() - t_llm) * 1000, 1),
-                         sources=len(sources),
-                         total_ms=round((time.perf_counter() - t_start) * 1000, 1))
-            _maybe_cache(query_vec, result, message)  #第二个参数传入的是字典
-            memory.add(session_id, message, result["reply"])
+                         sources=0, total_ms=round((time.perf_counter() - t_start) * 1000, 1))
+            _maybe_cache(query_vec, result, message)
+            memory.add(session_id, message, reply)
             traces.record(entry)
             return result
         except Exception as exc:  # CrewAI 调用失败 -> 降级
